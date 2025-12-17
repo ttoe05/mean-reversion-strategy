@@ -1,0 +1,9 @@
+scikit-learn
+statsmodels
+polars
+pandas
+fastparquet
+pyarrow
+numpy
+seaborn
+matplotlib

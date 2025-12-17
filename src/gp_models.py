@@ -1,0 +1,382 @@
+"""
+Gaussian Process regression models for bond yield forecasting.
+Implements different kernel types and model selection strategies.
+"""
+
+import numpy as np
+import pandas as pd
+from typing import Dict, Optional, Any
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.gaussian_process.kernels import (
+    WhiteKernel,
+    ConstantKernel, RationalQuadratic
+)
+from sklearn.metrics import r2_score
+from data_loader import DataLoader
+# from feature_manager import FeatureManager
+from base_ensemble_model import BaseEnsembleModel
+
+import logging
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class GaussianProcessEnsemble(BaseEnsembleModel):
+    """Ensemble of Gaussian Process models with different kernels."""
+    
+    def __init__(self, selection_metric: str = 'train_cosine_distance', random_state: int = 42, n_jobs: int = 3):
+        """
+        Initialize the GP ensemble.
+        
+        Args:
+            selection_metric: Metric for kernel selection
+            random_state: Random state for reproducibility
+            n_jobs: Number of parallel jobs
+        """
+        super().__init__(random_state=random_state, n_jobs=n_jobs)
+        
+        metrics = ['train_cosine_distance', 'train_euclidean_rmse', 'train_r2_avg', 'train_r2_flat']
+        if selection_metric not in metrics:
+            raise ValueError(f"Unknown metric: {selection_metric}. Available metrics: {metrics}")
+        self.selection_metric = selection_metric
+        self.kernels = None
+        self.fitted_models: Dict[str, MultiOutputRegressor] = {}
+        self.kernel_scores: Dict[str, Dict[str, float]] = {}
+        self.best_kernel_name: Optional[str] = None
+        self.best_model: Optional[MultiOutputRegressor] = None
+        self._create_kernel_configurations()
+
+
+    def _create_kernel_configurations(self) -> None:
+        """
+        Create different kernel configurations for testing.
+        
+        Returns:
+            Dictionary mapping kernel names to kernel objects
+        """
+        kernels = {
+            # 'DotProduct': DotProduct() + WhiteKernel(noise_level=1e-5),
+            
+            # 'ExpSineSquared': (ConstantKernel(1.0, (1e-3, 1e3)) *
+            #                   ExpSineSquared(length_scale=1.0, periodicity=1.0,
+            #                                length_scale_bounds=(1e-2, 1e2),
+            #                                periodicity_bounds=(1e-2, 1e2)) +
+            #                   WhiteKernel(noise_level=1e-5)),
+
+            # 'RBF': (ConstantKernel(1.0, (1e-3, 1e3)) *
+            #        RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e2)) +
+            #        WhiteKernel(noise_level=1e-5)),
+
+            # 'WhiteKernel': WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-10, 1e+1)),
+
+            # 'Matern': (ConstantKernel(1.0, (1e-3, 1e3)) *
+            #           Matern(length_scale=1.0, length_scale_bounds=(1e-2, 1e2), nu=1.5) +
+            #           WhiteKernel(noise_level=1e-5)),
+
+            'RationalQuadratic': (ConstantKernel(1.0, (1e-3, 1e3)) *
+                                 RationalQuadratic(length_scale=1.0, alpha=1.0,
+                                                 length_scale_bounds=(1e-2, 1e2),
+                                                 alpha_bounds=(1e-5, 1e5)) +
+                                 WhiteKernel(noise_level=1e-5)),
+
+            # 'QuasiPeriodic': (ConstantKernel(1.0, (1e-3, 1e3)) *
+            #                  RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e2)) *
+            #                  ExpSineSquared(length_scale=1.0, periodicity=1.0,
+            #                               length_scale_bounds=(1e-2, 1e2),
+            #                               periodicity_bounds=(1e-2, 1e2)) +
+            #                  WhiteKernel(noise_level=1e-5))
+        }
+        
+        logger.info(f"Created {len(kernels)} kernel configurations")
+        self.kernels = kernels
+
+
+    def create_gp_model(self, kernel_name: str, normalize_y: bool = False) -> GaussianProcessRegressor:
+        """
+        Create a Gaussian Process model with specified kernel.
+        
+        Args:
+            kernel_name: Name of the kernel to use
+            normalize_y: whether to normalize the dependent variable with 0 mean and unit variance
+            
+        Returns:
+            Configured GaussianProcessRegressor
+        """
+        if kernel_name not in self.kernels:
+            raise ValueError(f"Unknown kernel: {kernel_name}. "
+                           f"Available kernels: {list(self.kernels.keys())}")
+        
+        kernel = self.kernels[kernel_name]
+        
+        gp_model = GaussianProcessRegressor(
+            kernel=kernel,
+            alpha=1e-6,  # Nugget parameter for numerical stability
+            normalize_y=normalize_y,  # Normalize target values
+            n_restarts_optimizer=3,  # Number of restarts for optimization
+            random_state=self.random_state
+        )
+        
+        return gp_model
+
+    def _cosine_distance_avg(self, a: np.ndarray, b: np.ndarray) -> float:
+        """
+        Compute the cosine distance between two vectors.
+        """
+        a_norm = a / np.linalg.norm(a, axis=1, keepdims=True)
+        b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
+        cosine_similarity = np.sum(a_norm * b_norm, axis=1)
+        return np.mean(cosine_similarity)
+
+
+    def _euclidean_rmse_avg(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Compute the Euclidean RMSE between two vectors."""
+        errors = np.linalg.norm(a - b, axis=1)
+        return np.sqrt(np.mean(errors ** 2))
+
+
+    def rsquared_score_avg(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Compute the R-squared score between two vectors."""
+        scores = r2_score(a, b, multioutput='raw_values')
+        return np.mean(scores)
+
+    def rsquared_flat(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Compute the R-squared score between two flattened vectors."""
+        return r2_score(a.flatten(), b.flatten())
+
+
+    def ensemble_train_runner(self, task: tuple[pd.DataFrame, pd.Series, str, int]) -> Dict[str, Any]:
+        """
+        task: tuple
+            x: feature matrix
+            y: target vector
+            kernel_name: name of the kernel
+        Returns:
+            GaussianProcessRegressor
+        """
+        x, y, kernel_name = task
+        # create a copy of the data
+        x_copy = x.copy()
+        y_copy = y.copy()
+        model = self.create_gp_model(kernel_name=kernel_name)
+        model = MultiOutputRegressor(model, n_jobs=3)
+
+        # Fit model to get additional metrics
+        model.fit(x_copy, y_copy)
+        y_pred = model.predict(x_copy)
+        # get the residuals
+        residuals = y_copy.to_numpy() - y_pred
+
+        estimators = model.estimators_
+        metrics = {
+            'kernel_name': kernel_name,
+            'train_cosine_distance': self._cosine_distance_avg(y.to_numpy(), y_pred),
+            'train_euclidean_rmse': self._euclidean_rmse_avg(y.to_numpy(), y_pred),
+            'train_r2_avg': self.rsquared_score_avg(y.to_numpy(), y_pred),
+            'train_r2_flat': self.rsquared_flat(y.to_numpy(), y_pred),
+            'log_marginal_likelihood': [estimator.log_marginal_likelihood() for estimator in estimators],
+            'residuals': residuals,
+            'model': model,
+        }
+        return metrics
+
+
+    def train_historical(self, x: pd.DataFrame, y: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Train all the Gaussian Process models using the different kernels concurrently.
+        
+        Args:
+            x: Feature DataFrame
+            y: Target DataFrame
+            
+        Returns:
+            Dictionary with training metrics
+        """
+        # Validate inputs using base class method
+        self._validate_inputs(x, y)
+        
+        # Store training boundaries for prediction enforcement
+        self._store_training_boundaries(y)
+        
+        target_std = np.std(y.to_numpy(), axis=0)
+        tasks = [(x, y, kernel_name) for kernel_name in self.kernels.keys()]
+        results = []
+
+        # with ProcessPoolExecutor(max_workers=self.n_jobs) as executor:
+        #     futures = [executor.submit(self.ensemble_train_runner,task) for task in tasks]
+        #     for future in tqdm(as_completed(futures), desc='Kernels trained:', total=len(futures)):
+        #         res = future.result()
+        #         results.append(res)
+        task = self.ensemble_train_runner(tasks[0])
+        results.append(task)
+        # return the best model
+        results.sort(key=lambda x: x['train_cosine_distance'], reverse=True)
+        self.kernel_scores = {x['kernel_name']: {
+            'train_cosine_distance': x['train_cosine_distance'],
+            'train_euclidean_rmse': x['train_euclidean_rmse'],
+            'train_r2_avg': x['train_r2_avg'],
+            'train_r2_flat': x['train_r2_flat'],
+            'log_marginal_likelihood': x['log_marginal_likelihood'],
+            'target_std': target_std,
+            'residuals': x['residuals'],
+            'model': x['model']
+        } for x in results}
+        # select the best model
+        self._select_best_kernel()
+        self.is_trained = True
+        logger.info(f"Best kernel: {self.best_kernel_name}")
+        
+        # Return training summary
+        return {
+            'best_kernel': self.best_kernel_name,
+            'kernel_scores': self.kernel_scores[self.best_kernel_name],
+            'n_kernels_tested': len(self.kernels),
+            'training_samples': len(x),
+            'n_features': x.shape[1],
+            'target_columns': list(y.columns)
+        }
+
+    
+    def _select_best_kernel(self) -> None:
+        """
+        Select the best kernel based on cross-validation performance.
+        metric: str
+            Metric to use for selection. Options: 'train_cosine_distance', 'train_euclidean_rmse', 'train_r2_avg', 'train_r2_flat'
+        Returns:
+            None
+        """
+        # validate metric
+        # logger.info(f"Evaluating kernel performance based on {self.selection_metric}...")
+        if self.selection_metric == 'train_cosine_distance':
+            self.best_kernel_name = max(self.kernel_scores, key=lambda x: self.kernel_scores[x]['train_cosine_distance'])
+        elif self.selection_metric == 'train_euclidean_rmse':
+            self.best_kernel_name = min(self.kernel_scores, key=lambda x: self.kernel_scores[x]['train_euclidean_rmse'])
+        elif self.selection_metric == 'train_r2_avg':
+            self.best_kernel_name = max(self.kernel_scores, key=lambda x: self.kernel_scores[x]['train_r2_avg'])
+        else:
+            self.best_kernel_name = max(self.kernel_scores, key=lambda x: self.kernel_scores[x]['train_r2_flat'])
+
+        self.best_model = self.kernel_scores[self.best_kernel_name]['model']
+
+    
+    def predict_val(self, x: pd.DataFrame) -> np.ndarray:
+        """
+        Make predictions with uncertainty quantification.
+        
+        Args:
+            x: Feature matrix for prediction
+            
+        Returns:
+            Array of predictions
+        """
+        self._validate_trained()
+        self._validate_inputs(x)
+        
+        predictions = self.best_model.predict(x.values)
+        
+        # Apply prediction boundaries if available
+        if self.training_columns is not None and len(predictions.shape) == 2:
+            predictions = self._apply_prediction_boundaries(predictions, self.training_columns)
+        
+        return predictions
+
+
+
+
+    def predict_val_distribution(self, x: pd.DataFrame, y: pd.DataFrame, n_samples: int = 1000) -> pd.DataFrame:
+        """
+        Generate samples from the predictive distribution.
+
+        Args:
+            x: Feature matrix for prediction
+            y: Target DataFrame (for column names)
+            n_samples: Number of samples to draw
+            
+        Returns:
+            DataFrame with prediction samples
+        """
+        self._validate_trained()
+        self._validate_inputs(x)  # Only validate x, y is just for column reference
+        
+        residuals = self.kernel_scores[self.best_kernel_name]['residuals']
+        # get the mean prediction
+        y_mean = self.best_model.predict(x.values)
+        y_samples = np.array([
+            np.random.choice(residuals[:, col], size=n_samples, replace=True) for col in range(residuals.shape[1])
+                        ]).T
+        y_samples = y_mean + y_samples
+        
+        # Convert to DataFrame with proper column names
+        samples_df = pd.DataFrame(y_samples, columns=y.columns)
+        
+        # Apply prediction boundaries if available
+        if self.training_columns is not None:
+            bounded_samples = self._apply_prediction_boundaries(samples_df.values, list(samples_df.columns))
+            samples_df = pd.DataFrame(bounded_samples, columns=samples_df.columns)
+        
+        return samples_df
+    
+    def get_model_summary(self) -> Dict[str, Any]:
+        """
+        Get summary information about the fitted models.
+        
+        Returns:
+            Dictionary with model summary information
+        """
+        if self.best_model is None:
+            return {"status": "No model fitted"}
+
+        models = self.best_model.estimators_
+        summary = {
+            "best_kernel": self.best_kernel_name,
+            "best_kernel_params": [str(model.kernel_) for model in models],
+            "log_marginal_likelihood": [model.log_marginal_likelihood() for model in models],
+            # "kernel_scores": self.kernel_scores,
+            # "available_kernels": list(self.kernels.keys()),
+            "n_features": self.best_model.X_train_.shape[1] if hasattr(self.best_model, 'X_train_') else None,
+            "n_training_samples": self.best_model.X_train_.shape[0] if hasattr(self.best_model, 'X_train_') else None
+        }
+        
+        return summary
+
+    
+    def get_feature_importance_proxy(self, X: pd.DataFrame) -> pd.Series:
+        """
+        Get a proxy for feature importance using kernel gradients.
+        
+        Args:
+            X: Feature matrix used for training
+            
+        Returns:
+            Series with feature importance scores
+        """
+        if self.best_model is None:
+            raise ValueError("Must fit best model first")
+        
+        # For GP models, we can use the kernel's characteristic length scales
+        # as a proxy for feature importance (smaller length scale = more important)
+        model_list = self.best_model.estimators_
+        importance_scores_list = []
+        for model in model_list:
+            if hasattr(model.kernel_, 'length_scale'):
+                length_scales = self.best_model.kernel_.length_scale
+
+                if hasattr(length_scales, '__len__') and len(length_scales) == X.shape[1]:
+                    # Invert length scales: smaller length scale = higher importance
+                    importance_scores = 1.0 / (length_scales + 1e-10)
+                    importance_scores = importance_scores / importance_scores.sum()
+
+                    importance_scores_list.append(pd.Series(importance_scores, index=X.columns, name='importance'))
+
+            # Fallback: uniform importance
+            logger.warning("Could not extract feature importance, using uniform weights")
+            uniform_importance = np.ones(X.shape[1]) / X.shape[1]
+            importance_scores_list.append(pd.Series(uniform_importance, index=X.columns, name='importance'))
+        return pd.concat(importance_scores_list)
+
+
+# if __name__ == "__main__":
+    # pass
