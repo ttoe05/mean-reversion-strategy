@@ -31,13 +31,14 @@ class BaseEnsembleModel(ABC):
         self.training_percentiles: Optional[Dict[str, tuple]] = None
         
     @abstractmethod
-    def train_historical(self, x: pd.DataFrame, y: pd.DataFrame) -> Dict[str, Any]:
+    def train_historical(self, x: pd.DataFrame, y: pd.DataFrame, y_noise: pd.DataFrame) -> Dict[str, Any]:
         """
         Train the model on historical data.
         
         Args:
             x: Feature DataFrame
             y: Target DataFrame
+            y_noise: The actual target value that is not smoothed
             
         Returns:
             Dictionary with training metrics and model information
@@ -154,24 +155,27 @@ class BaseEnsembleModel(ABC):
         # calcluate the 3rd and 4th value from the standard deviation
         # for i, col in enumerate(column_names):
         #     if col in self.training_percentiles:
-                # td_3 = self.training_percentiles[col][3]
-                # p1, p99, mean_val, std_val = self.training_percentiles[col]
-                # clip_val1 = mean_val + (3 * std_val)
-                # clip_val2 = mean_val + (4.2 * std_val)
-                # # randomly sample a number between these two value
-                # clip_val = uniform(clip_val1, clip_val2)
-                #
-                # # Apply percentile boundaries
-                # if predictions.ndim == 1:
-                #     bounded_predictions[i] = np.clip(bounded_predictions[i], p1, clip_val)
-                # else:
-                #     bounded_predictions[:, i] = np.clip(bounded_predictions[:, i], p1, clip_val)
-                
-                # Apply yield floor (bond yields should not be negative)
-                # if predictions.ndim == 1:
-                #     bounded_predictions[i] = max(bounded_predictions[i], uniform(0.001, 0.1))  # 0.01%
-                # else:
-                #     bounded_predictions[:, i] = np.maximum(bounded_predictions[:, i], uniform(0.001, 0.1))
+        #         td_3 = self.training_percentiles[col][3]
+        #         p1, p99, mean_val, std_val = self.training_percentiles[col]
+        #         clip_val1 = mean_val + (3.5 * std_val)
+        #         clip_val2 = mean_val + (4.5 * std_val)
+        #         clip_val3 = mean_val - (3.7 * std_val)
+        #         clip_val4 = mean_val - (4.7 * std_val)
+        #         # randomly sample a number between these two value
+        #         clip_val_pos = uniform(clip_val1, clip_val2)
+        #         clip_val_neg = uniform(clip_val3, clip_val4)
+        #
+        #         # Apply percentile boundaries
+        #         if predictions.ndim == 1:
+        #             bounded_predictions[i] = np.clip(bounded_predictions[i], p1, clip_val_pos)
+        #         else:
+        #             bounded_predictions[:, i] = np.clip(bounded_predictions[:, i], p1, clip_val_pos)
+        #
+        #         # Apply yield floor (bond yields should not be negative)
+        #         if predictions.ndim == 1:
+        #             bounded_predictions[i] = np.clip(bounded_predictions[i], p99, clip_val_neg)
+        #         else:
+        #             bounded_predictions[:, i] = np.clip(bounded_predictions[:, i], p99, clip_val_neg)
         
         return bounded_predictions
     

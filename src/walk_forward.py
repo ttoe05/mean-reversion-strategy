@@ -83,10 +83,12 @@ class WalkForwardValidator:
         if self.use_scaling:
             self.scaler_x = StandardScaler()
             self.scaler_y = StandardScaler()
+            self.scaler_y_noise = StandardScaler()
             self.scalers_fitted = False
         else:
             self.scaler_x = None
             self.scaler_y = None
+            self.scaler_y_noise = None
             self.scalers_fitted = False
 
         # set up sample directory if true
@@ -111,6 +113,7 @@ class WalkForwardValidator:
                             train_end_idx: int, 
                             predict_idx: int,
                             target_columns: list[str],
+                            noise_columns: list[str],
                             features: List[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
         Run a single prediction step in walk-forward validation.
@@ -119,6 +122,7 @@ class WalkForwardValidator:
             train_start_idx: Start index of training window
             train_end_idx: End index of training window  
             predict_idx: Index to make prediction for
+            noise_columns: the name of the noise column, this is for calculating the residuals for the distribtion output
             target_columns: str: Target variable names
             bond_index: Bond index name
             features: List of feature names
@@ -133,14 +137,23 @@ class WalkForwardValidator:
             target_columns=target_columns,
             feature_columns=features
         )
+
+        _, y_train_noise = self.data_loader.get_window_data(
+            start_idx=train_start_idx,
+            end_idx=train_end_idx,
+            target_columns=noise_columns,
+            feature_columns=features
+        )
         
         # Validate training data before scaling
         if x_train.empty:
             raise ValueError(f"X_train is empty for window {train_start_idx}-{train_end_idx}")
         if y_train.empty:
             raise ValueError(f"Y_train is empty for window {train_start_idx}-{train_end_idx}")
+        if y_train_noise.empty:
+            raise ValueError(f"Y_train_noise is empty for window {train_start_idx}-{train_end_idx}")
         
-        logger.debug(f"Training data shapes: X={x_train.shape}, Y={y_train.shape}")
+        logger.debug(f"Training data shapes: X={x_train.shape}, Y={y_train.shape}, Y_noise={y_train_noise.shape}")
         
         # Apply scaling if enabled
         if self.use_scaling:
@@ -156,6 +169,12 @@ class WalkForwardValidator:
                     columns=y_train.columns,
                     index=y_train.index
                 )
+
+                y_train_noise_scaled = pd.DataFrame(
+                    self.scaler_y_noise.fit_transform(y_train_noise),
+                    columns=y_train_noise.columns,
+                    index=y_train_noise.index
+                )
                 self.scalers_fitted = True
             else:
                 # Transform using existing scalers
@@ -169,15 +188,21 @@ class WalkForwardValidator:
                     columns=y_train.columns,
                     index=y_train.index
                 )
+                y_train_noise_scaled = pd.DataFrame(
+                    self.scaler_y_noise.transform(y_train_noise),
+                    columns=y_train_noise.columns,
+                    index=y_train_noise.index
+                )
         else:
             x_train_scaled = x_train
             y_train_scaled = y_train
+            y_train_noise_scaled = y_train_noise
         # Check if a retrain is needed
         if self.model_retrain_counter == self.model_retrain_interval or self.initial_run:
             retrain = True
             logger.debug(f"Running retrain for window {x_train.index.min()}-{x_train.index.max()}")
             # train the model with scaled or original data
-            self.model.train_historical(x=x_train_scaled, y=y_train_scaled)
+            self.model.train_historical(x=x_train_scaled, y=y_train_scaled, y_noise=y_train_noise_scaled)
             self.feature_importance = self.model.get_feature_importance_proxy(X=x_train_scaled)
             # Reset counter
             self.model_retrain_counter = 0
@@ -252,6 +277,7 @@ class WalkForwardValidator:
                 'date': predict_date,
                 'actual_value': list(actual_value.to_numpy()),
                 'prediction': list(prediction_val),
+                # 'std': list(self.model.horizon_std),
                 # 'prediction_std': list(prediction_std),
                 'best_kernel': self.model.best_kernel_name,
                 'retrain': retrain,
@@ -270,6 +296,7 @@ class WalkForwardValidator:
                 'date': predict_date,
                 'actual_value': list(actual_value.to_numpy()),
                 'prediction': list(prediction_val),
+                'std': float(self.model.horizon_std),
                 'best_kernel': self.model.best_kernel_name,
                 'best_alpha': self.model.best_alpha_name,
                 'retrain': retrain,
@@ -312,7 +339,11 @@ class WalkForwardValidator:
         )
 
         # testing comment the following out when running the full validation
-        # windows = windows[-10:]
+        # check if the window is greater than 2500, if so select the last 2500 records
+        if len(windows) > 2500:
+            logging.info(f"The window size is greater than 2500, only running the last 2500 records")
+            windows = windows[-2500:]
+        # windows = windows[-30:]
 
         logger.info(f"Running {len(windows)} predictions with {len(features)} features")
         # Run predictions
@@ -331,6 +362,7 @@ class WalkForwardValidator:
                 train_end_idx=train_end_idx,
                 predict_idx=predict_idx,
                 target_columns=target_columns,
+                noise_columns=['Adj Close'],
                 features=features
             )
             # Store result

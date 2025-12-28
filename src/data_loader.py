@@ -36,7 +36,7 @@ class DataLoader:
         if not self.data_path.suffix == '.parquet':
             raise ValueError("Data file must be a .parquet file")
     
-    def load_data(self, x: List[str], y: List[str], actuals: List[str] = None) -> None:
+    def load_data(self, x: List[str], y: List[str], actuals: List[str] = None, adj_close: bool = True) -> None:
         """
         Load the bond data from parquet file.
         
@@ -58,9 +58,15 @@ class DataLoader:
             # Sort by date
             df_tmp.sort_index(inplace=True)
             if actuals is None or y == actuals:
-                full_columns = list(set(x + y))  # Remove duplicates
+                if adj_close:
+                    full_columns = list(set(x + y)) + ['Adj Close']  # Remove duplicates
+                else:
+                    full_columns = list(set(x + y))
             else:
-                full_columns = list(set(x + y + actuals))  # Remove duplicates
+                if adj_close:
+                    full_columns = list(set(x + y + actuals)) + ['Adj Close'] # Remove duplicates
+                else:
+                    full_columns = list(set(x + y + actuals))
             # handle nulls
             df_tmp = df_tmp[full_columns].dropna()
             logger.info(f"Loaded data: {df_tmp.shape[0]} rows, {df_tmp.shape[1]} columns")

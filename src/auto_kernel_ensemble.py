@@ -122,13 +122,14 @@ class KernelAutoregressiveModel(BaseEnsembleModel):
         logger.info(f"Created {len(kernels)} kernel configurations")
         return kernels
     
-    def train_historical(self, x: pd.DataFrame, y: pd.DataFrame) -> Dict[str, Any]:
+    def train_historical(self, x: pd.DataFrame, y: pd.DataFrame, y_noise: pd.DataFrame) -> Dict[str, Any]:
         """
         Train the autoregressive model on historical data.
         
         Args:
             x: Feature DataFrame with lag columns
             y: Target DataFrame (single column expected)
+            y_noise: The actual target value that is not smoothed
             
         Returns:
             Dictionary with training metrics and model information
@@ -140,12 +141,15 @@ class KernelAutoregressiveModel(BaseEnsembleModel):
         if y.shape[1] > 1:
             logger.warning(f"Multiple targets provided, using first column: {y.columns[0]}")
             y_single = y.iloc[:, 0]
+            y_single_noise = y_noise.iloc[:, 0]
         else:
             y_single = y.iloc[:, 0]
+            y_single_noise = y_noise.iloc[:, 0]
         
         # Store training data for horizon validation
         self.X_train = x.copy()
         self.y_train = y_single.copy()
+        self.y_train_noise = y_single_noise.copy()
         
         # Setup cross-validation
         tscv = TimeSeriesSplit(n_splits=3)
@@ -200,7 +204,7 @@ class KernelAutoregressiveModel(BaseEnsembleModel):
         self.best_params = best_params
         
         # Calculate horizon-specific residuals for distribution modeling
-        self.horizon_std = self._calculate_horizon_residuals(x, y_single, self.forecast_horizon)
+        self.horizon_std = self._calculate_horizon_residuals(x, y_single_noise, y_single)
         
         # Calculate training metrics
         train_pred = self.best_model.predict(x)
@@ -293,7 +297,8 @@ class KernelAutoregressiveModel(BaseEnsembleModel):
             columns = [f"prediction_sample_{i}" for i in range(len(x))]
         
         return pd.DataFrame(samples_array.T, columns=columns)
-    
+
+
     def get_model_summary(self) -> Dict[str, Any]:
         """
         Get summary of trained model performance and parameters.
@@ -368,7 +373,8 @@ class KernelAutoregressiveModel(BaseEnsembleModel):
             current_lags = self._create_future_features(current_lags, pred)
         
         return np.array(predictions)
-    
+
+
     def _create_future_features(self, current_lags: np.ndarray, new_prediction: float) -> np.ndarray:
         """
         Create feature vector for next prediction using previous forecast.
@@ -387,7 +393,7 @@ class KernelAutoregressiveModel(BaseEnsembleModel):
         
         return new_lags
     
-    def _calculate_horizon_residuals(self, X_train: pd.DataFrame, y_train: pd.Series, horizon: int) -> float:
+    def _calculate_horizon_residuals(self, X_train: pd.DataFrame, y_train_noise: pd.Series, y_train: pd.Series) -> float:
         """
         Calculate residuals at forecast horizon r for distribution modeling.
         
@@ -399,30 +405,33 @@ class KernelAutoregressiveModel(BaseEnsembleModel):
         Returns:
             Standard deviation of horizon residuals
         """
-        if len(y_train) < horizon + 1:
+        if len(y_train) < self.forecast_horizon + 1:
             logger.warning("Insufficient data for horizon validation, using training std")
             return y_train.std()
         
         # Create horizon-shifted targets for validation
-        y_horizon = y_train.shift(-horizon).dropna()
+        y_horizon = y_train.shift(-self.forecast_horizon).dropna()
+        y_horizon_noise = y_train_noise.shift(-self.forecast_horizon).dropna()
         X_horizon = X_train.iloc[:len(y_horizon)]
-        
+
         if len(y_horizon) == 0:
             logger.warning("No valid horizon data, using training std")
             return y_train.std()
-        
+
         # Make recursive predictions for horizon validation
         horizon_predictions = []
         for idx in range(len(X_horizon)):
             initial_lags = X_horizon.iloc[idx].values
-            pred_sequence = self._forecast_recursive(initial_lags, horizon)
+            pred_sequence = self._forecast_recursive(initial_lags, self.forecast_horizon)
             horizon_predictions.append(pred_sequence[-1])
-        
+        #
         # Calculate residuals
-        residuals = np.abs(np.array(horizon_predictions) - y_horizon.values)
+        # conver the horizon_predictions to a numpy array
+        horizon_predictions = np.array(horizon_predictions)
+        residuals = np.abs(horizon_predictions - y_horizon_noise.to_numpy())
         horizon_std = np.mean(residuals)  # Use mean absolute residual as std
         
-        logger.debug(f"Calculated horizon std: {horizon_std:.4f} from {len(residuals)} samples")
+        logger.debug(f"Calculated std: {horizon_std:.4f} from {len(residuals)} samples")
         
         return horizon_std
     
@@ -460,13 +469,14 @@ if __name__ == "__main__":
     y_col = '30 Day Avg'
 
     # train the autoregressive model on the first 400 events
-    auto_kernel.train_historical(x=sample_data[x_cols].iloc[:400], y=sample_data[y_col].iloc[:400].to_frame())
+    auto_kernel.train_historical(x=sample_data[x_cols].iloc[:400], y=sample_data[y_col].iloc[:400].to_frame(), y_noise=sample_data['Adj Close'].iloc[:400].to_frame())
     print(f"model trained")
     test = sample_data.iloc[400:430]
     predictions = []
     for idx in test[x_cols].index:
         x_vals = test[x_cols].loc[[idx]]
         single_prediction = auto_kernel.predict_val(x_vals)
+        # prediction_distribution = auto_kernel.predict_val_distribution(x_vals, test[y_col])
         predictions.append(single_prediction[0])
 
     len(predictions)
