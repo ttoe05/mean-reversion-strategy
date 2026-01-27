@@ -3,8 +3,8 @@
 *.parq
 *.csv
 
-# Documentation
-*.md
+# Claude directory (planning and temporary files)
+claude/
 
 # Python cache
 __pycache__/
